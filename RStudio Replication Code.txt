@@ -1,0 +1,583 @@
+#Load packages
+library(SoupX)
+library(Seurat)
+library(monocle3)
+library(SeuratWrappers)
+library(scCustomize)
+library(ShinyCell)
+
+setwd("Z:")
+ids <- read.csv("Stout/samples.txt", header=FALSE)
+
+#Run SoupX decontamination pipeline to remove ambient RNA (Young et al., 2020)
+sc1=load10X("Stout/scRNA/1/outs/")
+sc2=load10X("Stout/scRNA/2/outs/")
+sc3=load10X("Stout/scRNA/3/outs/")
+sc4=load10X("Stout/scRNA/4/outs/")
+sc5=load10X("Stout/scRNA/5/outs/")
+sc6=load10X("Stout/scRNA/6/outs/")
+sc7=load10X("Stout/scRNA/7/outs/")
+sc8=load10X("Stout/scRNA/8/outs/")
+
+sc1=autoEstCont(sc1)
+sc2=autoEstCont(sc2)
+sc3=autoEstCont(sc3)
+sc4=autoEstCont(sc4)
+sc5=autoEstCont(sc5)
+sc6=autoEstCont(sc6)
+sc7=autoEstCont(sc7)
+sc8=autoEstCont(sc8)
+
+out1=adjustCounts(sc1)
+out2=adjustCounts(sc2)
+out3=adjustCounts(sc3)
+out4=adjustCounts(sc4)
+out5=adjustCounts(sc5)
+out6=adjustCounts(sc6)
+out7=adjustCounts(sc7)
+out8=adjustCounts(sc8)
+
+#Create Seurat objects from SoupX output above
+scrna.list = list()
+scrna.list[[1]] = CreateSeuratObject(counts = out1, min.cells=10, min.features=100, project="1");
+scrna.list[[2]] = CreateSeuratObject(counts = out2, min.cells=10, min.features=100, project="2");
+scrna.list[[3]] = CreateSeuratObject(counts = out3, min.cells=10, min.features=100, project="3");
+scrna.list[[4]] = CreateSeuratObject(counts = out4, min.cells=10, min.features=100, project="4");
+scrna.list[[5]] = CreateSeuratObject(counts = out5, min.cells=10, min.features=100, project="5");
+scrna.list[[6]] = CreateSeuratObject(counts = out6, min.cells=10, min.features=100, project="6");
+scrna.list[[7]] = CreateSeuratObject(counts = out7, min.cells=10, min.features=100, project="7");
+scrna.list[[8]] = CreateSeuratObject(counts = out8, min.cells=10, min.features=100, project="8");
+
+#Merge into a single Seurat object
+experiment.aggregate <- merge(x=scrna.list[[1]], y=c(scrna.list[[2]],
+scrna.list[[3]],scrna.list[[4]], scrna.list[[5]],scrna.list[[6]],
+scrna.list[[7]],scrna.list[[8]]), 
+add.cell.ids = c(ids[1,1],ids[2,1],
+ids[3,1],ids[4,1],ids[5,1],ids[6,1],
+ids[7,1],ids[8,1]), project="ovary")
+
+#Annotate mitochondrial genes
+mito.genes <- grep("^mt-", rownames(experiment.aggregate@assays[["RNA"]]@data), value = T)
+
+#Calulate the percent mitochondrial transcripts for each cell
+percent.mito <- Matrix::colSums(experiment.aggregate@assays[["RNA"]]@data[mito.genes, ])/Matrix::colSums(experiment.aggregate@assays[["RNA"]]@data)
+
+#Add the percent mitochondrial transcripts as meta-data in Seurat object
+experiment.aggregate <- AddMetaData(
+  object = experiment.aggregate,
+  metadata = percent.mito,
+  col.name= "percent.mito")
+
+#Annotate ribosomal genes
+experiment.aggregate <- PercentageFeatureSet(experiment.aggregate, "^Rp[sl]", col.name = "percent_ribo")
+
+#Annotate hemoglobin genes
+experiment.aggregate <- PercentageFeatureSet(experiment.aggregate, "^Hb[^(p)]", col.name = "percent_hb")
+experiment.aggregate <- PercentageFeatureSet(experiment.aggregate, "Pecam1|Pf4", col.name = "percent_plat")
+
+#Check to make sure all QC data has been added to the Seurat object
+head(experiment.aggregate[[]])
+
+#Plot QC features as VlnPlots
+QC_feats <- c("nFeature_RNA", "nCount_RNA", "percent.mito", "percent_ribo", "percent_hb")
+
+#Combined violin plot of QC metrics before filtering
+VlnPlot(
+  experiment.aggregate,
+  group.by="orig.ident",
+  features = QC_feats,
+  ncol = 3, pt.size = 0.1)
+
+#Print out number of cells per sample
+samplename=experiment.aggregate@meta.data[["orig.ident"]]
+table(samplename)
+
+#Define age group (or other experimental group) and add as meta-data
+age = rep("YOUNG",length(samplename))
+age[samplename %in% c("5", "6", "7", "8")] = "OLD"
+names(age) = rownames(experiment.aggregate@meta.data)
+
+#Add age as meta data
+experiment.aggregate <- AddMetaData(
+  object = experiment.aggregate,
+  metadata = age,
+  col.name = "age")
+
+#do.call("cbind", tapply(experiment.aggregate@meta.data[["nFeature_RNA"]],experiment.aggregate@meta.data[["orig.ident"]],quantile,probs=seq(0,1,0.05)))
+RidgePlot(experiment.aggregate, features="nFeature_RNA", group.by="orig.ident")
+
+round(do.call("cbind", tapply(experiment.aggregate@meta.data[["percent.mito"]],experiment.aggregate@meta.data[["orig.ident"]],quantile,probs=seq(0,1,0.05))), digits = 3)
+RidgePlot(experiment.aggregate, features="percent.mito", group.by="orig.ident")
+
+do.call("cbind", tapply(experiment.aggregate@meta.data[["nCount_RNA"]],experiment.aggregate@meta.data[["orig.ident"]],quantile,probs=seq(0,1,0.05)))
+RidgePlot(experiment.aggregate, features="nCount_RNA", group.by="orig.ident")
+
+
+Idents(experiment.aggregate) <- "orig.ident"
+
+
+#Detection-based filtering
+#Here we will only consider cells with at least 200 detected genes and genes need to be expressed in at least 3 cells. 
+#Please note that those values are highly dependent on the library preparation method used.
+
+selected_c <- WhichCells(experiment.aggregate, expression = nFeature_RNA > 200)
+selected_f <- rownames(experiment.aggregate)[Matrix::rowSums(experiment.aggregate) > 3]
+
+#Do not filter on number of features yet, as high number of features can indicate doublets
+
+data.filt <- subset(experiment.aggregate, features = selected_f, cells = selected_c)
+dim(data.filt)
+ncol(data.filt)
+
+
+# Compute the relative expression of each gene per cell Use sparse matrix
+# operations, if your dataset is large, doing matrix devisions the regular way
+# will take a very long time.
+par(mar = c(4, 8, 2, 1))
+C <- data.filt@assays$RNA@counts
+C <- Matrix::t(Matrix::t(C)/Matrix::colSums(C)) * 100
+most_expressed <- order(apply(C, 1, median), decreasing = T)[20:1]
+boxplot(as.matrix(t(C[most_expressed, ])), cex = 0.1, las = 1, xlab = "% total count per cell",
+    col = (scales::hue_pal())(20)[20:1], horizontal = TRUE)
+	
+	
+#Filter based on mitochondrial and ribosomal transcripts
+data.filt <- subset(data.filt, subset = percent.mito < 0.25 & percent_ribo > 5)
+dim(data.filt)
+
+# Filter MALAT1
+data.filt <- data.filt[!grepl("Malat1", rownames(data.filt)), ]
+data.filt <- data.filt[!grepl("Gm42418", rownames(data.filt)), ]
+data.filt <- data.filt[!grepl("Gm26917", rownames(data.filt)), ]
+data.filt <- data.filt[!grepl("Ay036118", rownames(data.filt)), ]
+
+#Filter Ribossomal gene (optional if that is a problem on your data) 
+data.filt<- data.filt[ ! grepl('^Rp[SL]', rownames(data.filt)), ]
+
+
+#Combined violin plot of QC metrics after filtering
+VlnPlot(
+  data.filt,
+  features = c("nFeature_RNA", "nCount_RNA","percent.mito", "percent_ribo", "percent_hb", "percent_plat"),
+  ncol = 2, pt.size = 0.1)
+
+#Print out number of surviving cells per sample after filtering
+table(data.filt$orig.ident)
+
+#Calculate cell-cycle scores
+data.filt = NormalizeData(data.filt)
+#install.packages("stringr")
+library(stringr)
+s.genes <- str_to_title(cc.genes$s.genes)
+g2m.genes <- str_to_title(cc.genes$g2m.genes)
+data.filt <- CellCycleScoring(object = data.filt, g2m.features = g2m.genes,
+    s.features = s.genes)
+VlnPlot(data.filt, features = c("S.Score", "G2M.Score"), group.by = "orig.ident",
+    ncol = 4, pt.size = 0.1)
+	
+head(data.filt[[]])
+Idents(data.filt) <- "orig.ident"
+
+
+#Load DoubletFinder to remove doublets
+#remotes::install_github('chris-mcginnis-ucsf/DoubletFinder') 
+library(DoubletFinder)
+suppressMessages(require(DoubletFinder))
+
+#Filters out Doublets
+
+data.filt = FindVariableFeatures(data.filt, verbose = F)
+#data.filt = ScaleData(data.filt, vars.to.regress = c("nFeature_RNA", "percent.mito", "S.Score", "G2M.Score"), verbose = F)
+data.filt = ScaleData(data.filt, vars.to.regress = c("nFeature_RNA", "percent.mito"), verbose = F)
+
+#Determine dimensionality of data
+data.filt <- RunPCA(data.filt, features = VariableFeatures(object = data.filt))
+#DimHeatmap(data.filt, dims = 1:15, cells = 500, balanced = TRUE)
+#data.filt <- JackStraw(data.filt, num.replicate = 100)
+#data.filt <- ScoreJackStraw(data.filt, dims = 1:20)
+#JackStrawPlot(data.filt, dims = 1:20)
+
+
+data.filt = RunPCA(data.filt, verbose = F, npcs = 20)
+data.filt = RunUMAP(data.filt, dims = 1:20, verbose = F)
+
+#Number of expected doublets based on 10X loaded and expected recovery
+nExp <- round(ncol(data.filt) * 0.05)  # expect 5% 
+
+#DoubletFinder parameter optimization
+# Optimal pK is the max of the bomodality coefficent (BCmvn) distribution
+#This is a lengthy process, so once optimized comment this out
+#sweep.res <- paramSweep_v3(data.filt)
+#sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
+#bcmvn <- find.pK(sweep.stats)
+#barplot(bcmvn$BCmetric, names.arg = bcmvn$pK, las=2)
+
+#Run Doublet Finder to identify doublets
+library(DoubletFinder)
+data.filt <- doubletFinder_v3(data.filt, pN = 0.25, pK = 0.01, nExp = nExp, PCs = 1:10)
+dim(data.filt)
+DF.name = colnames(data.filt@meta.data)[grepl("DF.classification", colnames(data.filt@meta.data))]
+
+cowplot::plot_grid(ncol = 2, DimPlot(data.filt, group.by = "orig.ident") + NoAxes(),
+        DimPlot(data.filt, group.by = DF.name) + NoAxes())
+
+VlnPlot(data.filt, features = "nFeature_RNA", group.by = DF.name, pt.size = 0.1)
+
+data.filt = data.filt[, data.filt@meta.data[, DF.name] == "Singlet"]
+dim(data.filt)
+
+#Visualize the UMAP clustering by age, perform integration only if there appears to be batch effects
+DimPlot(data.filt,group.by="age", label=TRUE)
+ 
+  
+#No integration is needed for this data set, comment out
+#experiment.aggregate<-SplitObject(data.filt, split.by = "age")
+#experiment.aggregate <- lapply(X = experiment.aggregate, FUN = function(x) {
+#     x <- NormalizeData(x)
+#     x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+# })
+
+#features <- SelectIntegrationFeatures(object.list = experiment.aggregate)
+#experiment.aggregate <- lapply(X = experiment.aggregate, FUN = function(x) {
+#     x <- ScaleData(x, features = features, verbose = FALSE)
+#     x <- RunPCA(x, features = features, verbose = FALSE)
+# })
+
+#age.anchors <- FindIntegrationAnchors(object.list = experiment.aggregate, anchor.features = features, reduction = "rpca")
+#age.combined <- IntegrateData(anchorset = age.anchors)
+#DefaultAssay(age.combined) <- "integrated"
+
+
+age.combined <- FindNeighbors(data.filt, reduction = "pca", dims = 1:20)
+
+#Clustree can be used to determine the optimal resolution when finding clusters (Zappia et al., 2018)
+#install.packages("clustree")
+#library(clustree)
+# Select a range of resolutions
+#resolution.range <- seq(from = 0, to = 0.4, by = 0.05)
+# Find clusters using a range of resolutions
+#age.combined <- Seurat::FindClusters(object = object, resolution = resolution.range)
+#clustree(age.combined)
+
+#Cluster samples 
+age.combined <- FindClusters(age.combined, resolution = 0.2)
+DimPlot(age.combined,split.by="age", label=TRUE)
+
+#find markers that distinguish clusters
+age.markers <- FindAllMarkers(
+	age.combined, only.pos = TRUE, 
+	min.pct = 0.01, logfc.threshold = 0.25)
+
+#write.csv(age.markers, "age.markersSROv2.csv")
+
+
+#Remove contaminating oviduct cells
+age.combined<-subset(age.combined, idents=c("0","1","2","3","4","5","6","7","8","9","10","11","12","13","15"))
+#DimPlot(age.combined, label=TRUE)
+
+#Seperates Clusters into Young and Old
+age.combined$cluster.age <- paste(Idents(age.combined), age.combined$age, sep = "_")
+age.combined$cluster <- Idents(age.combined)
+Idents(age.combined) <- "cluster.age"
+
+#Revert back to age combined clusters using Idents(age.combined) <- "cluster"
+
+
+#Creates excel sheets listing the markers for each cluster compared across ages (only need to run once)
+#clust0_age <- FindMarkers(age.combined, "0_OLD", "0_YOUNG", thresh.use = 0)
+#clust1_age <- FindMarkers(age.combined, "1_OLD", "1_YOUNG", thresh.use = 0)
+#clust2_age <- FindMarkers(age.combined, "2_OLD", "2_YOUNG", thresh.use = 0)
+#clust3_age <- FindMarkers(age.combined, "3_OLD", "3_YOUNG", thresh.use = 0)
+#clust4_age <- FindMarkers(age.combined, "4_OLD", "4_YOUNG", thresh.use = 0)
+#clust5_age <- FindMarkers(age.combined, "5_OLD", "5_YOUNG", thresh.use = 0)
+#clust6_age <- FindMarkers(age.combined, "6_OLD", "6_YOUNG", thresh.use = 0)
+#clust7_age <- FindMarkers(age.combined, "7_OLD", "7_YOUNG", thresh.use = 0)
+#clust8_age <- FindMarkers(age.combined, "8_OLD", "8_YOUNG", thresh.use = 0)
+#clust9_age <- FindMarkers(age.combined, "9_OLD", "9_YOUNG", thresh.use = 0)
+#clust10_age <- FindMarkers(age.combined, "10_OLD", "10_YOUNG", thresh.use = 0)
+#clust11_age <- FindMarkers(age.combined, "11_OLD", "11_YOUNG", thresh.use = 0)
+#clust12_age <- FindMarkers(age.combined, "12_OLD", "12_YOUNG", thresh.use = 0)
+#clust13_age <- FindMarkers(age.combined, "13_OLD", "13_YOUNG", thresh.use = 0)
+#clust14_age <- FindMarkers(age.combined, "14_OLD", "14_YOUNG", thresh.use = 0)
+#clust15_age <- FindMarkers(age.combined, "15_OLD", "15_YOUNG", thresh.use = 0)
+#write.csv(clust0_age, "clust0_age_SRO.csv")
+#write.csv(clust1_age, "clust1_age_SRO.csv")
+#write.csv(clust2_age, "clust2_age_SRO.csv")
+#write.csv(clust3_age, "clust3_age_SRO.csv")
+#write.csv(clust4_age, "clust4_age_SRO.csv")
+#write.csv(clust5_age, "clust5_age_SRO.csv")
+#write.csv(clust6_age, "clust6_age_SRO.csv")
+#write.csv(clust7_age, "clust7_age_SRO.csv")
+#write.csv(clust8_age, "clust8_age_SRO.csv")
+#write.csv(clust9_age, "clust9_age_SRO.csv")
+#write.csv(clust10_age, "clust10_age_SRO.csv")
+#write.csv(clust11_age, "clust11_age_SRO.csv")
+#write.csv(clust12_age, "clust12_age_SRO.csv")
+#write.csv(clust13_age, "clust13_age_SRO.csv")
+#write.csv(clust14_age, "clust14_age_SRO.csv")
+#write.csv(clust15_age, "clust15_age_SRO.csv")
+
+
+#Creating Subclusters for each type of clustering (Immune Cells, Stroma Cells, Granulosa/Luteal/Oocyte Cells, Endothelium/Epithelium Cells) 
+Idents(age.combined) <- "cluster"
+
+#Immune Cells
+immune <-subset(age.combined, idents=c("5","6","9","13"))
+immune <- ScaleData(immune, verbose = FALSE)
+immune <- RunPCA(immune, npcs = 30, verbose = FALSE)
+immune <- RunUMAP(immune, reduction = "pca", dims = 1:10)
+immune <- FindNeighbors(immune, reduction = "pca", dims = 1:10)
+immune <- FindClusters(immune, resolution = 0.3)
+DimPlot(immune)
+DimPlot(immune, split.by = "age")
+
+#Stroma Cells
+stroma <-subset(age.combined, idents=c("0","2","3","8"))
+stroma <- ScaleData(stroma, verbose = FALSE)
+stroma <- RunPCA(stroma, npcs = 30, verbose = FALSE)
+stroma <- RunUMAP(stroma, reduction = "pca", dims = 1:5)
+stroma <- FindNeighbors(stroma, reduction = "pca", dims = 1:5)
+stroma <- FindClusters(stroma, resolution = 0.2)
+DimPlot(stroma)
+DimPlot(stroma, split.by = "age")
+
+#Granulosa/Luteal/Oocyte Cells
+granulosa <-subset(age.combined, idents=c("1","7","11","12"))
+granulosa <- ScaleData(granulosa, verbose = FALSE)
+granulosa <- RunPCA(granulosa, npcs = 30, verbose = FALSE)
+granulosa <- RunUMAP(granulosa, reduction = "pca", dims = 1:5)
+granulosa <- FindNeighbors(granulosa, reduction = "pca", dims = 1:5)
+granulosa <- FindClusters(granulosa, resolution = 0.2)
+DimPlot(granulosa)
+DimPlot(granulosa, split.by = "age")
+
+#Endothelium/Epithelium Cells
+thelium <-subset(age.combined, idents=c("4","10","15"))
+thelium <- ScaleData(thelium, verbose = FALSE)
+thelium <- RunPCA(thelium, npcs = 30, verbose = FALSE)
+thelium <- RunUMAP(thelium, reduction = "pca", dims = 1:5)
+thelium <- FindNeighbors(thelium, reduction = "pca", dims = 1:5)
+thelium <- FindClusters(thelium, resolution = 0.05)
+DimPlot(thelium)
+DimPlot(thelium, split.by = "age")
+
+
+#Find markers that distinguish subclusters (only need to run once)
+#immune.markers <- FindAllMarkers(immune, only.pos=TRUE)
+#stroma.markers <- FindAllMarkers(stroma, only.pos=TRUE)
+#granulosa.markers <- FindAllMarkers(granulosa, only.pos=TRUE)
+#thelium.markers <- FindAllMarkers(thelium, only.pos=TRUE)
+#write.csv(immune.markers, "Immune.markers.csv")
+#write.csv(stroma.markers, "Stroma.markers.csv")
+#write.csv(granulosa.markers, "Granulosa.markers.csv")
+#write.csv(thelium.markers, "Thelium.markers.csv")
+
+
+#Seperates subclusters into Young and Old and creates excel sheets of their markers for IPA analysis
+immune$cluster.age <- paste(Idents(immune), immune$age, sep = "_")
+immune$cluster <- Idents(immune)
+Idents(immune) <- "cluster.age"
+
+stroma$cluster.age <- paste(Idents(stroma), stroma$age, sep = "_")
+stroma$cluster <- Idents(stroma)
+Idents(stroma) <- "cluster.age"
+
+granulosa$cluster.age <- paste(Idents(granulosa), granulosa$age, sep = "_")
+granulosa$cluster <- Idents(granulosa)
+Idents(granulosa) <- "cluster.age"
+
+thelium$cluster.age <- paste(Idents(thelium), thelium$age, sep = "_")
+thelium$cluster <- Idents(thelium)
+Idents(thelium) <- "cluster.age"
+
+#Revert back using Idents(subcluster name) <- "cluster"
+
+
+#ShinyCell
+seu = readRDS("readySeu_rset.rds")
+scConf = createConfig(seu)
+makeShinyApp(seu, scConf, gene.mapping = TRUE,
+             shiny.title = "ShinyCell - Ovary seqRNA") 
+
+
+#CellChat Interactions
+#age.combined
+age.combined <- RenameIdents(object = age.combined, `0` = "Stroma A", `1` = "Granulosa A", `2` = "Stroma B", '3' = "Theca", `4` = "Endothelium", `5` = "Phagocytes A", `6` = "T-Lymphocytes", '7' = "Granulosa B", `8` = "Stroma C", `9` = "Phagocytes B", `10` = "Epithelium A", '11' = "Oocytes", `12` = "Luteal", `13` = "B-Lymphocytes", `15` = "Epithelium B")
+age.combined[["cluster.names"]] <- Idents(object = age.combined)
+cellchat <- createCellChat(age.combined)
+CellChatDB <- CellChatDB.mouse
+#cellchat <- aggregateNet(cellchat)
+dplyr::glimpse(CellChatDB$interaction)
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling")
+cellchat@DB <- CellChatDB.use
+cellchat <- subsetData(cellchat)
+#future::plan("multiprocess", workers = 4)
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+cellchat <- computeCommunProb(cellchat)
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+
+#OLD CellChat
+Idents(age.combined) <- "age"
+age.old <- subset(age.combined, idents=c("OLD"))
+Idents(age.old) <- "cluster.names"
+cellchat.old <- createCellChat(age.old)
+CellChatDB <- CellChatDB.mouse
+#cellchat <- aggregateNet(cellchat)
+dplyr::glimpse(CellChatDB$interaction)
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling")
+cellchat.old@DB <- CellChatDB.use
+cellchat.old <- subsetData(cellchat.old)
+#future::plan("multiprocess", workers = 4)
+cellchat.old <- identifyOverExpressedGenes(cellchat.old)
+cellchat.old <- identifyOverExpressedInteractions(cellchat.old)
+cellchat.old <- computeCommunProb(cellchat.old)
+cellchat.old <- filterCommunication(cellchat.old, min.cells = 10)
+cellchat.old <- computeCommunProbPathway(cellchat.old)
+cellchat.old <- aggregateNet(cellchat.old)
+groupSize <- as.numeric(table(cellchat.old@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchat.old@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions - OLD")
+netVisual_circle(cellchat.old@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength - OLD")
+
+#YOUNG CellChat
+Idents(age.combined) <- "age"
+age.young <- subset(age.combined, idents=c("YOUNG"))
+Idents(age.young) <- "cluster.names"
+cellchat.young <- createCellChat(age.young)
+CellChatDB <- CellChatDB.mouse
+#cellchat <- aggregateNet(cellchat)
+dplyr::glimpse(CellChatDB$interaction)
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling")
+cellchat.young@DB <- CellChatDB.use
+cellchat.young <- subsetData(cellchat.young)
+#future::plan("multiprocess", workers = 4)
+cellchat.young <- identifyOverExpressedGenes(cellchat.young)
+cellchat.young <- identifyOverExpressedInteractions(cellchat.young)
+cellchat.young <- computeCommunProb(cellchat.young)
+cellchat.young <- filterCommunication(cellchat.young, min.cells = 10)
+cellchat.young <- computeCommunProbPathway(cellchat.young)
+cellchat.young <- aggregateNet(cellchat.young)
+groupSize <- as.numeric(table(cellchat.young@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchat.young@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions - YOUNG")
+netVisual_circle(cellchat.young@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength - YOUNG")
+
+
+
+#Immune CellChat
+immune <- RenameIdents(object = immune, `0` = "Unidentified Macrophages", `1` = "Tissue Macrophages", `2` = "CD8+ T-cells", '3' = "B-cells", `4` = "Natural Killer Cells", `5` = "Dendritic Cells A", `6` = "CD4+ T-cells", '7' = "Neutrophils/Monocytes", `8` = "Innate Lymphoid Cells 3", `9` = "Mitotic Immune Cells", `10` = "Dendritic Cells B", '11' = "Innate Lymphoid Cells 2", `12` = "CD300e+ Macrophages")
+immune[["cluster.names"]] <- Idents(object = immune)
+immuneCC <- createCellChat(immune)
+CellChatDB <- CellChatDB.mouse
+#cellchat <- aggregateNet(cellchat)
+dplyr::glimpse(CellChatDB$interaction)
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling")
+immuneCC@DB <- CellChatDB.use
+immuneCC <- subsetData(immuneCC)
+#future::plan("multiprocess", workers = 4)
+immuneCC <- identifyOverExpressedGenes(immuneCC)
+immuneCC <- identifyOverExpressedInteractions(immuneCC)
+immuneCC <- computeCommunProb(immuneCC)
+immuneCC <- filterCommunication(immuneCC, min.cells = 10)
+immuneCC <- computeCommunProbPathway(immuneCC)
+immuneCC <- aggregateNet(immuneCC)
+groupSize <- as.numeric(table(immuneCC@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(immuneCC@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions - Immune Age Combined")
+netVisual_circle(immuneCC@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength - Immune Age Combined")
+
+
+#Stroma CellChat
+stroma <- RenameIdents(object = stroma, `0` = "GC Markers", `1` = "Fibroblast-like", `2` = "Theca", '3' = "Early Theca", `4` = "Pericytes", `5` = "Smooth Muscle")
+stroma[["cluster.names"]] <- Idents(object = stroma)
+stromaCC <- createCellChat(stroma)
+CellChatDB <- CellChatDB.mouse
+#cellchat <- aggregateNet(cellchat)
+dplyr::glimpse(CellChatDB$interaction)
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling")
+stromaCC@DB <- CellChatDB.use
+stromaCC <- subsetData(stromaCC)
+#future::plan("multiprocess", workers = 4)
+stromaCC <- identifyOverExpressedGenes(stromaCC)
+stromaCC <- identifyOverExpressedInteractions(stromaCC)
+stromaCC <- computeCommunProb(stromaCC)
+stromaCC <- filterCommunication(stromaCC, min.cells = 10)
+stromaCC <- computeCommunProbPathway(stromaCC)
+stromaCC <- aggregateNet(stromaCC)
+groupSize <- as.numeric(table(stromaCC@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(stromaCC@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions - Stroma Age Combined")
+netVisual_circle(stromaCC@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength - Stroma Age Combined")
+
+#Granulosa CellChat
+granulosa <- RenameIdents(object = granulosa, `0` = "Antral GC", `1` = "Atretic GC", `2` = "Preantral GC", '3' = "Mitotic GC", `4` = "Oocytes", `5` = "Luteal")
+granulosa[["cluster.names"]] <- Idents(object = granulosa)
+granulosaCC <- createCellChat(granulosa)
+CellChatDB <- CellChatDB.mouse
+#cellchat <- aggregateNet(cellchat)
+dplyr::glimpse(CellChatDB$interaction)
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling")
+granulosaCC@DB <- CellChatDB.use
+granulosaCC <- subsetData(granulosaCC)
+#future::plan("multiprocess", workers = 4)
+granulosaCC <- identifyOverExpressedGenes(granulosaCC)
+granulosaCC <- identifyOverExpressedInteractions(granulosaCC)
+granulosaCC <- computeCommunProb(granulosaCC)
+granulosaCC <- filterCommunication(granulosaCC, min.cells = 10)
+granulosaCC <- computeCommunProbPathway(granulosaCC)
+granulosaCC <- aggregateNet(granulosaCC)
+groupSize <- as.numeric(table(granulosaCC@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(granulosaCC@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions - Granulosa Age Combined")
+netVisual_circle(granulosaCC@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength - Granulosa Age Combined")
+
+#Thelium CellChat
+thelium <- RenameIdents(object = thelium, `0` = "Vascular Endothelium", `1` = "GC Markers", `2` = "Epithelium", '3' = "Lymphatic Endothelium")
+thelium[["cluster.names"]] <- Idents(object = thelium)
+theliumCC <- createCellChat(thelium)
+CellChatDB <- CellChatDB.mouse
+#cellchat <- aggregateNet(cellchat)
+dplyr::glimpse(CellChatDB$interaction)
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling")
+theliumCC@DB <- CellChatDB.use
+theliumCC <- subsetData(theliumCC)
+#future::plan("multiprocess", workers = 4)
+theliumCC <- identifyOverExpressedGenes(theliumCC)
+theliumCC <- identifyOverExpressedInteractions(theliumCC)
+theliumCC <- computeCommunProb(theliumCC)
+theliumCC <- filterCommunication(theliumCC, min.cells = 10)
+theliumCC <- computeCommunProbPathway(theliumCC)
+theliumCC <- aggregateNet(theliumCC)
+groupSize <- as.numeric(table(theliumCC@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(theliumCC@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions - Thelium Age Combined")
+netVisual_circle(theliumCC@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength - Thelium Age Combined")
+
+#Make YOUNG and OLD variables for subclusters
+Idents(immune) <- "age"
+Idents(stroma) <- "age"
+Idents(granulosa) <- "age"
+Idents(thelium) <- "age"
+
+immune.young <-subset(immune, idents=c("YOUNG"))
+immune.old <-subset(immune, idents=c("OLD"))
+stroma.young <-subset(stroma, idents=c("YOUNG"))
+stroma.old <-subset(stroma, idents=c("OLD"))
+granulosa.young <-subset(granulosa, idents=c("YOUNG"))
+granulosa.old <-subset(granulosa, idents=c("OLD"))
+thelium.young <-subset(thelium, idents=c("YOUNG"))
+thelium.old <-subset(thelium, idents=c("OLD"))
+
+
+
+
+
+
+
